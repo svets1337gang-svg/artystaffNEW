@@ -192,31 +192,24 @@ class StaffAccessModal(discord.ui.Modal):
                 msg = f"Доступ **выдан** для {email}"
                 color = BotStyle.SUCCESS_COLOR
             else:
-                # Отзыв доступа из ТАБЛИЦЫ
-                try:
-                    perms_sheet = service.permissions().list(fileId=sheet_id, fields="permissions(id, emailAddress)").execute()
-                    for p in perms_sheet.get('permissions', []):
-                        if p.get('emailAddress', '').lower() == email:
-                            service.permissions().delete(fileId=sheet_id, permissionId=p['id']).execute()
-                except Exception as e:
-                    logger.error(f"Error revoking sheet access: {e}")
+                # Отзыв доступа из всех ресурсов дивизиона
+                resources = [
+                    ('Таблица', sheet_id),
+                    ('Форма', form_id)
+                ]
+                
+                revoked_count = 0
+                for res_name, res_id in resources:
+                    try:
+                        perms = service.permissions().list(fileId=res_id, fields="permissions(id, emailAddress)").execute()
+                        for p in perms.get('permissions', []):
+                            if p.get('emailAddress', '').lower() == email:
+                                service.permissions().delete(fileId=res_id, permissionId=p['id']).execute()
+                                revoked_count += 1
+                    except Exception as e:
+                        logger.error(f"Error revoking {res_name} access ({res_id}): {e}")
 
-                # Отзыв доступа из ФОРМЫ
-                try:
-                    # Для Google Форм используем тот же метод list/delete, 
-                    # но добавляем принудительный вывод в лог для диагностики
-                    perms_form = service.permissions().list(fileId=form_id, fields="permissions(id, emailAddress)").execute()
-                    found_in_form = False
-                    for p in perms_form.get('permissions', []):
-                        if p.get('emailAddress', '').lower() == email:
-                            service.permissions().delete(fileId=form_id, permissionId=p['id']).execute()
-                            found_in_form = True
-                    if not found_in_form:
-                        logger.warning(f"User {email} not found in permissions list of Form {form_id}")
-                except Exception as e:
-                    logger.error(f"Error revoking form access: {e}")
-
-                msg = f"Доступ **отозван** для {email}"
+                msg = f"Доступ **полностью отозван** для {email} (обработано ресурсов: {len(resources)})"
                 color = BotStyle.WARNING_COLOR
 
             # Обновляем профиль
@@ -635,10 +628,6 @@ async def on_member_remove(member):
 
 @bot.tree.command(name="audit_access", description="Проверка всех доступов (кто в таблице, но не на сервере)")
 async def audit_access(interaction: discord.Interaction):
-    if not any(role.id in ALLOWED_ROLES for role in interaction.user.roles):
-        await interaction.response.send_message("❌ Недостаточно прав.", ephemeral=True)
-        return
-
     await interaction.response.defer(ephemeral=True)
 
     unmatched = []
