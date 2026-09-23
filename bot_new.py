@@ -18,104 +18,16 @@ from config import (
     RW_WARN_COST, RW_WARNING_COST, RW_VACATION_COST,
     ALLOWED_ROLES
 )
+from ui_components import (
+    StaffMainView, StaffAccessView, StaffPointsView, StaffPunishmentView,
+    StaffAccessModal, StaffPointsModal, StaffPunishmentModal
+)
+from style import BotStyle
+from google_manager import google_manager, normalize_nick, parse_points
 
 # ===== НАСТРОЙКИ ЛОГИРОВАНИЯ =====
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger('StaffBot')
-
-# ===== КОНФИГУРАЦИЯ СТИЛЯ (High-End Look) =====
-class BotStyle:
-    PRIMARY_COLOR = discord.Color.from_rgb(72, 126, 174) # Элегантный серо-голубой
-    SUCCESS_COLOR = discord.Color.green()
-    WARNING_COLOR = discord.Color.gold()
-    ERROR_COLOR = discord.Color.red()
-    FOOTER_TEXT = "Staff Management System • Professional Edition"
-    
-    @staticmethod
-    def create_embed(title, description, color=PRIMARY_COLOR, fields=None):
-        embed = discord.Embed(
-            title=title,
-            description=description,
-            color=color
-        )
-        if fields:
-            for name, value, inline in fields:
-                embed.add_field(name=name, value=value, inline=inline)
-        
-        embed.set_footer(text=BotStyle.FOOTER_TEXT)
-        embed.timestamp = datetime.utcnow()
-        return embed
-
-# ===== ГУГЛ СЕРВИСЫ (ОПТИМИЗИРОВАННЫЕ) =====
-class GoogleManager:
-    def __init__(self):
-        # Автоматически определяем путь к папке с ботом
-        self.base_dir = os.path.dirname(os.path.abspath(__file__))
-        
-        # Проверяем, переданы ли данные JSON напрямую через переменную окружения
-        creds_json = os.getenv('GOOGLE_CREDS_JSON')
-        
-        if creds_json and creds_json.strip():
-            # Если данные в переменной, создаем временный файл для совместимости с gspread/google-api
-            self.creds_path = os.path.join(self.base_dir, 'credentials_tmp.json')
-            try:
-                with open(self.creds_path, 'w', encoding='utf-8') as f:
-                    f.write(creds_json)
-                logger.info("Credentials created from environment variable.")
-            except Exception as e:
-                logger.error(f"Failed to create credentials file from env: {e}")
-        else:
-            # Иначе ищем путь в .env или используем стандартный файл
-            env_path = os.getenv('GOOGLE_CREDS_PATH')
-            if env_path and env_path.strip():
-                self.creds_path = env_path
-            else:
-                self.creds_path = os.path.join(self.base_dir, 'credentials.json')
-
-        self._drive_service = None
-        self._gc = None
-
-    def get_drive_service(self):
-        if self._drive_service is None:
-            try:
-                creds = Credentials.from_service_account_file(self.creds_path)
-                scoped_creds = creds.with_scopes(['https://www.googleapis.com/auth/drive'])
-                self._drive_service = build('drive', 'v3', credentials=scoped_creds)
-            except Exception as e:
-                logger.error(f"Google Drive API Error: {e}")
-        return self._drive_service
-
-    def get_gc(self):
-        if self._gc is None:
-            try:
-                self._gc = gspread.service_account(filename=self.creds_path)
-            except Exception as e:
-                logger.error(f"Gspread Error: {e}")
-        return self._gc
-
-    def get_sheet(self, sheet_id, sheet_name):
-        try:
-            gc = self.get_gc()
-            return gc.open_by_key(sheet_id).worksheet(sheet_name)
-        except Exception as e:
-            logger.error(f"Error getting sheet {sheet_name}: {e}")
-            return None
-
-google_manager = GoogleManager()
-
-# ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====
-def normalize_nick(nick: str) -> str:
-    if not nick: return ""
-    return re.sub(r'\[[^\]]*\]|\([^)]*\)|\{[^}]*\}', '', nick).strip()
-
-def parse_points(value) -> int:
-    if not value: return 0
-    s = str(value).strip().replace(' ', '').replace(',', '').replace('\xa0', '')
-    try:
-        return int(float(s))
-    except:
-        return 0
-
 # =========================================================
 # UI COMPONENTS (Interactive Layer)
 # =========================================================
@@ -128,6 +40,7 @@ async def auto_delete_message(message, delay=420):
     except Exception as e:
         logger.debug(f"Auto-delete failed: {e}")
 
+# Код интерфейса (Modals, Views) перенесен в ui_components.py
 class StaffAccessModal(discord.ui.Modal):
     def __init__(self, action_type, employee_data, division):
         # Если мы забираем доступ, почта берется из таблицы, и ввод не нужен
@@ -626,41 +539,109 @@ async def on_member_remove(member):
 
 # ===== COMMANDS =====
 
+class AuditView(discord.ui.View):
+    def __init__(self, interaction, division='FT'):
+        super().__init__(timeout=None)
+        self.interaction = interaction
+        self.division = division
+
+    async def update_audit(self, interaction, division):
+        await interaction.response.defer()
+        
+        # Параметры в зависимости от дивизиона
+        if division == 'FT':
+            s_id, s_name = FT_GOOGLE_SHEETS_ID, FT_SHEET_NAME
+        else:
+            s_id, s_name = RW_GOOGLE_SHEETS_ID, RW_SHEET_NAME
+
+        sheet = google_manager.get_sheet(s_id, s_name)
+        if not sheet:
+            await interaction.followup.send("❌ Ошибка подключения к таблице.", ephemeral=True)
+            return
+
+        names = sheet.col_values(1)
+        guild = interaction.guild
+        unmatched = []
+
+        for name in names:
+            clean_name = normalize_nick(name)
+            # ОЧИСТКА: Пропускаем пустые строки, "вакантно" и подобные технические записи
+            if not clean_name or clean_name.lower() in ['вакантно', 'vacant', 'пусто']:
+                continue
+
+            member = discord.utils.get(guild.members, name=clean_name)
+            if not member:
+                member = discord.utils.get(guild.members, display_name=clean_name)
+            
+            if not member:
+                unmatched.append(f"• {clean_name}")
+
+        if not unmatched:
+            description = f"✅ Все сотрудники дивизиона **{division}** присутствуют на сервере."
+            color = BotStyle.SUCCESS_COLOR
+        else:
+            description = f"Следующие сотрудники **{division}** значатся в таблице, но **отсутствуют** на сервере:\n\n" + "\n".join(unmatched)
+            color = BotStyle.WARNING_COLOR
+
+        embed = BotStyle.create_embed(
+            f"🔍 Аудит доступов • {division}",
+            description,
+            color=color
+        )
+        
+        await interaction.edit_original_response(embed=embed, view=AuditView(interaction, division))
+
+    @discord.ui.button(label="Дивизион FT", style=discord.ButtonStyle.primary, custom_id="audit_ft")
+    async def ft_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.update_audit(interaction, 'FT')
+
+    @discord.ui.button(label="Дивизион RW", style=discord.ButtonStyle.primary, custom_id="audit_rw")
+    async def rw_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.update_audit(interaction, 'RW')
+
 @bot.tree.command(name="audit_access", description="Проверка всех доступов (кто в таблице, но не на сервере)")
 async def audit_access(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-
-    unmatched = []
-    guild = interaction.guild
-
-    # Проверяем FT и RW
-    for s_id, s_name, div in [(FT_GOOGLE_SHEETS_ID, FT_SHEET_NAME, 'FT'), (RW_GOOGLE_SHEETS_ID, RW_SHEET_NAME, 'RW')]:
-        sheet = google_manager.get_sheet(s_id, s_name)
-        if not sheet: continue
-
-        names = sheet.col_values(1)
-        for name in names:
-            clean_name = normalize_nick(name)
-            if not clean_name: continue
-
-            # Проверяем, есть ли кто-то с таким ником на сервере
-            member = discord.utils.get(guild.members, name=clean_name)
-            if not member:
-                # Проверяем по никнейму сервера
-                member = discord.utils.get(guild.members, display_name=clean_name)
-            if not member:
-                unmatched.append(f"[{div}] {clean_name}")
-
-    if not unmatched:
-        await interaction.followup.send("✅ Все сотрудники из таблиц присутствуют на сервере.", ephemeral=True)
+    
+    # По умолчанию запускаем аудит для FT
+    view = AuditView(interaction, 'FT')
+    # Чтобы первая загрузка прошла, вызываем внутренний метод вручную через фиктивный interaction
+    # Но проще всего создать временный класс для первой отправки:
+    
+    s_id, s_name = FT_GOOGLE_SHEETS_ID, FT_SHEET_NAME
+    sheet = google_manager.get_sheet(s_id, s_name)
+    if not sheet:
+        await interaction.followup.send("❌ Ошибка подключения к таблице.", ephemeral=True)
         return
 
+    names = sheet.col_values(1)
+    guild = interaction.guild
+    unmatched = []
+
+    for name in names:
+        clean_name = normalize_nick(name)
+        if not clean_name or clean_name.lower() in ['вакантно', 'vacant', 'пусто']:
+            continue
+        member = discord.utils.get(guild.members, name=clean_name)
+        if not member:
+            member = discord.utils.get(guild.members, display_name=clean_name)
+        if not member:
+            unmatched.append(f"• {clean_name}")
+
+    if not unmatched:
+        description = "✅ Все сотрудники дивизиона **FT** присутствуют на сервере."
+        color = BotStyle.SUCCESS_COLOR
+    else:
+        description = "Следующие сотрудники **FT** значатся в таблице, но **отсутствуют** на сервере:\n\n" + "\n".join(unmatched)
+        color = BotStyle.WARNING_COLOR
+
     embed = BotStyle.create_embed(
-        "🔍 Результаты аудита доступов",
-        "Следующие сотрудники значатся в таблицах, но **отсутствуют** на сервере:\n\n" + "\n".join(unmatched),
-        color=BotStyle.WARNING_COLOR
+        "🔍 Аудит доступов • FT",
+        description,
+        color=color
     )
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
 @bot.tree.command(name="staff", description="Центр управления сотрудником")
 @app_commands.describe(nick="Ник сотрудника")
 async def staff_command(interaction: discord.Interaction, nick: str):
