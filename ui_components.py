@@ -252,8 +252,13 @@ def _apply_access(division, nick, action, email):
         try:
             # revoke_permission перебирает страницы прав Drive (максимум
             # 100 на страницу) — inline-версия без пагинации могла молча
-            # «промахнуться» по email на больших таблицах.
-            google_manager.revoke_permission(sheet_id, email)
+            # «промахнуться» по email на больших таблицах. False означает
+            # «право не найдено» — раньше это считалось успехом.
+            if not google_manager.revoke_permission(sheet_id, email):
+                sheet_ok = False
+                sheet_err = ("право не найдено на таблице — возможно, доступ "
+                             "выдан по ссылке, а не лично на email")
+                logger.warning(f"Sheet permission for {email} not found on {sheet_id}")
         except Exception as e:
             sheet_ok = False
             sheet_err = describe_google_error(e)
@@ -283,9 +288,23 @@ def _apply_access(division, nick, action, email):
         parts.append(f"• таблица — не отозван: {sheet_err}")
     if not form_ok:
         parts.append(f"• форма — не отозван: {form_err}")
+
+    # Скрытая причина «доступ не забирается вообще»: файл открыт по ссылке
+    # на запись — удаление личного права ничего не меняет, доступ остаётся
+    # у всех, у кого есть ссылка. Подсказываем это менеджеру напрямую.
+    link_hint = ""
+    for file_id, label in ((sheet_id, "Таблица"), (form_id, "форма")):
+        link = google_manager.link_writer_access(file_id)
+        if link:
+            scope = ("всем, у кого есть ссылка" if link[0] == 'anyone'
+                     else "всем пользователям домена")
+            link_hint += (f"\n⚠️ {label} открыта на запись {scope}: личный отзыв "
+                          f"не закрывает доступ. Уберите ссылочный доступ "
+                          f"в настройках файла («Поделиться» → «Все, у кого "
+                          f"есть ссылка» → «Ограничить»).")
     return (True,
             f"⚠️ Доступ отозван **частично** для {email}\n" + "\n".join(parts) +
-            "\n\nПодробности в логе бота.",
+            link_hint + "\n\nПодробности в логе бота.",
             BotStyle.ERROR_COLOR, updated)
 
 

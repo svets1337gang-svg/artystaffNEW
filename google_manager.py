@@ -199,6 +199,37 @@ class GoogleManager:
         """Отозвать доступ к Google Form через Drive API."""
         return self.revoke_permission(form_id, email)
 
+    def link_writer_access(self, file_id):
+        """('anyone'|'domain', role), если файл открыт по ссылке на запись.
+
+        Главная скрытая причина «доступ не отзывается вообще»: при
+        ссылочном доступе на редактирование удаление права конкретного
+        email ничего не меняет — доступ остаётся через ссылку. Возвращает
+        None, если ссылочного доступа на запись нет или запрос не удался
+        (проверка диагностическая и молча деградирует).
+        """
+        service = self.get_drive_service()
+        if service is None:
+            return None
+        try:
+            page_token = None
+            while True:
+                resp = service.permissions().list(
+                    fileId=file_id,
+                    fields='permissions(type, role), nextPageToken',
+                    pageSize=100,
+                    pageToken=page_token,
+                ).execute()
+                for p in resp.get('permissions', []):
+                    if p.get('type') in ('anyone', 'domain') and p.get('role') == 'writer':
+                        return p.get('type'), p.get('role')
+                page_token = resp.get('nextPageToken')
+                if not page_token:
+                    break
+        except Exception as e:
+            logger.error(f"Link access check failed for {file_id}: {e}")
+        return None
+
     def get_service_account_email(self):
         """Email сервис-аккаунта — его нужно добавить в файлы Google.
 
