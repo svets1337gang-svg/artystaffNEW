@@ -440,31 +440,73 @@ def find_user_by_nick(nick, sheet_id, sheet_name, fresh=False, reraise=False):
     target = clean_nick.lower()
     start = sheet_start_row(sheet_id, sheet_name)
     for row_num, row in enumerate(values, start=1):
-        if row_num < start:
+        if row_num < start or not row:
             continue
-        if row and normalize_nick(row[0]).lower() == target:
+        if normalize_nick(row[0]).lower() != target:
+            continue
+        # Служебные строки (заголовки, «Вакантно», даты) совпасть не могут;
+        # баллы не требуем — сотрудник с пустой колонкой баллов тоже ищется.
+        if is_staff_row(row, require_points=False):
             return _row_to_user(values, row_num)
     return None
 
 
-# Технические записи в колонке ников: не являются сотрудниками.
-# Используются и в аудите доступов, и в автокомплите /staff.
-SKIP_NICKS = {'вакантно', 'vacant', 'пусто'}
-
 # Заголовки секций состава («Высшая Администрация и Высшая Модерация
-# проекта» и т.п.) и прочие строки, которые стоят в колонке ников, но
-# сотрудниками не являются. Совпадение — подстрока без учёта регистра,
-# поэтому «Высшая администрация» и «ВЫСШАЯ АДМИНИСТРАЦИЯ» отсекутся тоже.
-SECTION_MARKERS = (
-    'администрация', 'администраци', 'модерация проекта', 'стажеры проекта',
-    'стажёры проекта', 'состав ft', 'состав rw', 'высшая', 'руководство',
-)
+# проекта», «Хелперы проекта»), «Вакантно» с опечатками, «Дата» и сами
+# даты — всё это стоит в колонке ников, но сотрудниками не является.
+# Список точных слов такой мусор не ловит (опечатки, новые формулировки),
+# поэтому фильтр структурный: сотрудник — это строка, у которой заполнены
+# и ник, и баллы.
+
+# Строки-даты: «21.10.2025», «2025-10-21», «21/10», «10.2025». Проверяются
+# ДО числового разбора, иначе «21.10.2025» распознался бы как число 21.
+_DATE_RE = re.compile(r'^\d{1,4}([./-]\d{1,4}){1,3}$')
+
+# Слова, которые в колонке ников сотрудниками не являются, даже если
+# рядом проставлены баллы («Вакантно», «вакансия», «vacant», «пусто», «нет»).
+_SKIP_WORDS = {'вакантно', 'вакансия', 'vacant', 'пусто', 'нет', 'none', '-'}
 
 
-def is_section_row(nick: str) -> bool:
-    """True, если строка колонки ников — заголовок секции, а не сотрудник."""
-    low = (nick or '').strip().lower()
-    return any(marker in low for marker in SECTION_MARKERS)
+def _is_number(value) -> bool:
+    """True, если значение колонки баллов — число («1 000», «1,5», «0»)."""
+    try:
+        int(float(str(value).strip().replace(' ', '').replace(',', '')
+                  .replace('\xa0', '')))
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def is_staff_row(row, require_points=True) -> bool:
+    """True, если строка листа — реальный сотрудник, а не служебная.
+
+    row — сырая строка таблицы (list). Сотрудник обязан иметь непустой ник
+    (после срезания клан-тегов) и не быть словом-заглушкой или датой.
+    Дальше два режима:
+    - require_points=True (списки: /top, /stat, автокомплит): колонка
+      баллов обязана быть числом. У заголовков секций, «Вакантно» и дат
+      она пуста или нечисловая, а у сотрудников там всегда число (хотя бы 0).
+    - require_points=False (поиск по нику для /staff): баллов может не
+      быть, но тогда должна быть заполнена хотя бы одна другая колонка
+      (должность, наказания, почта). Пустая строка-заглушка с опечаткой
+      («Вакантто») так отсеивается, а сотрудник с незаполненными баллами
+      не становится «невидимым» для карточки.
+    """
+    if not row:
+        return False
+    clean = normalize_nick(row[0]).strip()
+    if not clean:
+        return False
+    if clean.lower() in _SKIP_WORDS:
+        return False
+    if _DATE_RE.match(clean):
+        return False
+    points_raw = row[2] if len(row) > 2 else ''
+    if _is_number(points_raw):
+        return True
+    if require_points:
+        return False
+    return any(str(cell).strip() for cell in row[1:])
 
 
 def sheet_start_row(sheet_id, sheet_name) -> int:
@@ -484,8 +526,8 @@ def sheet_start_row(sheet_id, sheet_name) -> int:
 def list_nicks(sheet_id, sheet_name):
     """Все ники сотрудников дивизиона (для автокомплита /staff).
 
-    Служебные записи («вакантно» и т.п.) и строки выше границы состава
-    исключаются.
+    Служебные записи и строки выше границы состава исключаются
+    (см. is_staff_row).
     """
     values = google_manager.get_table(sheet_id, sheet_name)
     if values is None:
@@ -495,9 +537,8 @@ def list_nicks(sheet_id, sheet_name):
     for row_num, row in enumerate(values, start=1):
         if row_num < start or not row:
             continue
-        nick = normalize_nick(row[0])
-        if nick and nick.lower() not in SKIP_NICKS and not is_section_row(nick):
-            nicks.append(nick)
+        if is_staff_row(row):
+            nicks.append(normalize_nick(row[0]))
     return nicks
 
 
@@ -515,7 +556,8 @@ def collect_staff(sheet_id, sheet_name, reraise=False):
 
     Один список строк вместо повторных обходов таблицы — из него строятся
     и /top (лидерборд по баллам), и /stat (карточка одного сотрудника).
-    Служебные записи («вакантно» и т.п.) исключаются.
+    Служебные строки (заголовки секций, «Вакантно», даты) исключаются
+    структурным фильтром is_staff_row.
     Каждый элемент: {nick, position, points, warns, strikes, warn_limit,
     strike_limit, email, row}.
     """
@@ -527,13 +569,12 @@ def collect_staff(sheet_id, sheet_name, reraise=False):
     for row_num, row in enumerate(values, start=1):
         if row_num < start or not row:
             continue
-        nick = normalize_nick(row[0])
-        if not nick or nick.lower() in SKIP_NICKS or is_section_row(nick):
+        if not is_staff_row(row):
             continue
         user = _row_to_user(values, row_num)
         staff.append({
             'row': row_num,
-            'nick': nick,
+            'nick': normalize_nick(row[0]),
             'position': user.get('position', ''),
             'email': user.get('email', ''),
             'points': parse_points(user.get('points')),
