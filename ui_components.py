@@ -225,9 +225,12 @@ def _apply_access(division, nick, action, email):
     if action == 'grant':
         if service is None:
             return False, "❌ Drive API недоступен (см. лог).", BotStyle.ERROR_COLOR, None
+        # sendNotificationEmail=False — как в формовом хелпере: выдача
+        # доступа не должна слать сотруднику письмо от Google.
         service.permissions().create(
             fileId=sheet_id,
             body={'type': 'user', 'role': 'writer', 'emailAddress': email},
+            sendNotificationEmail=False,
         ).execute()
         # Форма: Drive API не работает с Google Forms (403) — только Forms API
         try:
@@ -259,7 +262,14 @@ def _apply_access(division, nick, action, email):
     form_ok = True
     form_err = ""
     try:
-        google_manager.remove_form_permission(form_id, email)
+        # remove_form_permission возвращает False, если право не найдено
+        # или не удалено. Раньше результат игнорировался, и бот рапортовал
+        # «полностью отозван», хотя право на форме оставалось на месте.
+        if not google_manager.remove_form_permission(form_id, email):
+            form_ok = False
+            form_err = ("право не найдено на форме — проверьте, что доступ "
+                        "выдавался именно на этот email")
+            logger.warning(f"Form permission for {email} not found on {form_id}")
     except Exception as e:
         form_ok = False
         form_err = describe_google_error(e)

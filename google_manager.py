@@ -16,6 +16,7 @@ from config import (
     FT_GOOGLE_SHEETS_ID, FT_SHEET_NAME, FT_GOOGLE_FORM_ID,
     RW_GOOGLE_SHEETS_ID, RW_SHEET_NAME, RW_GOOGLE_FORM_ID,
     FT_WARN_LIMIT, FT_STRIKE_LIMIT, RW_WARN_LIMIT, RW_STRIKE_LIMIT,
+    FT_SHEET_START_ROW, RW_SHEET_START_ROW,
 )
 
 logger = logging.getLogger('StaffBot.GoogleManager')
@@ -426,6 +427,8 @@ def find_user_by_nick(nick, sheet_id, sheet_name, fresh=False, reraise=False):
     повторные вызовы в пределах TTL берутся из кэша. fresh=True обходит кэш.
     reraise=True поднимает GoogleAPIError с понятным текстом вместо возврата
     None при недоступной таблице (None остаётся для «сотрудник не найден»).
+    Ищет только в строках состава (см. sheet_start_row) — служебные строки
+    листа совпасть не могут.
     Синхронная — из асинхронного кода вызывать через asyncio.to_thread.
     """
     clean_nick = normalize_nick(nick)
@@ -435,7 +438,10 @@ def find_user_by_nick(nick, sheet_id, sheet_name, fresh=False, reraise=False):
     if values is None:
         return None
     target = clean_nick.lower()
+    start = sheet_start_row(sheet_id, sheet_name)
     for row_num, row in enumerate(values, start=1):
+        if row_num < start:
+            continue
         if row and normalize_nick(row[0]).lower() == target:
             return _row_to_user(values, row_num)
     return None
@@ -445,21 +451,52 @@ def find_user_by_nick(nick, sheet_id, sheet_name, fresh=False, reraise=False):
 # Используются и в аудите доступов, и в автокомплите /staff.
 SKIP_NICKS = {'вакантно', 'vacant', 'пусто'}
 
+# Заголовки секций состава («Высшая Администрация и Высшая Модерация
+# проекта» и т.п.) и прочие строки, которые стоят в колонке ников, но
+# сотрудниками не являются. Совпадение — подстрока без учёта регистра,
+# поэтому «Высшая администрация» и «ВЫСШАЯ АДМИНИСТРАЦИЯ» отсекутся тоже.
+SECTION_MARKERS = (
+    'администрация', 'администраци', 'модерация проекта', 'стажеры проекта',
+    'стажёры проекта', 'состав ft', 'состав rw', 'высшая', 'руководство',
+)
+
+
+def is_section_row(nick: str) -> bool:
+    """True, если строка колонки ников — заголовок секции, а не сотрудник."""
+    low = (nick or '').strip().lower()
+    return any(marker in low for marker in SECTION_MARKERS)
+
+
+def sheet_start_row(sheet_id, sheet_name) -> int:
+    """Номер строки (с 1), с которой в этом листе начинаются сотрудники.
+
+    Всё выше — шапка и служебные строки — не парсится. Граница задаётся
+    в config (FT_SHEET_START_ROW / RW_SHEET_START_ROW) и настраивается
+    через .env, если листы перестроят.
+    """
+    if (sheet_id, sheet_name) == (FT_GOOGLE_SHEETS_ID, FT_SHEET_NAME):
+        return FT_SHEET_START_ROW
+    if (sheet_id, sheet_name) == (RW_GOOGLE_SHEETS_ID, RW_SHEET_NAME):
+        return RW_SHEET_START_ROW
+    return 1
+
 
 def list_nicks(sheet_id, sheet_name):
     """Все ники сотрудников дивизиона (для автокомплита /staff).
 
-    Служебные записи («вакантно» и т.п.) исключаются.
+    Служебные записи («вакантно» и т.п.) и строки выше границы состава
+    исключаются.
     """
     values = google_manager.get_table(sheet_id, sheet_name)
     if values is None:
         return []
+    start = sheet_start_row(sheet_id, sheet_name)
     nicks = []
-    for row in values:
-        if not row:
+    for row_num, row in enumerate(values, start=1):
+        if row_num < start or not row:
             continue
         nick = normalize_nick(row[0])
-        if nick and nick.lower() not in SKIP_NICKS:
+        if nick and nick.lower() not in SKIP_NICKS and not is_section_row(nick):
             nicks.append(nick)
     return nicks
 
@@ -485,12 +522,13 @@ def collect_staff(sheet_id, sheet_name, reraise=False):
     values = google_manager.get_table(sheet_id, sheet_name, reraise=reraise)
     if values is None:
         return []
+    start = sheet_start_row(sheet_id, sheet_name)
     staff = []
     for row_num, row in enumerate(values, start=1):
-        if not row:
+        if row_num < start or not row:
             continue
         nick = normalize_nick(row[0])
-        if not nick or nick.lower() in SKIP_NICKS:
+        if not nick or nick.lower() in SKIP_NICKS or is_section_row(nick):
             continue
         user = _row_to_user(values, row_num)
         staff.append({

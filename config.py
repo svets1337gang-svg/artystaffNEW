@@ -28,6 +28,14 @@ RW_GOOGLE_FORM_ID = os.getenv('RW_GOOGLE_FORM_ID', '1NZmtXX4kHrOH8U1n6QQ2fAZbeik
 RW_WARN_COST = int(os.getenv('RW_WARN_COST', 1000))
 RW_WARNING_COST = int(os.getenv('RW_WARNING_COST', 350))
 
+# ===== ГРАНИЦЫ ПАРСИНГА СОСТАВА =====
+# Строка, с которой начинаются строки сотрудников. Всё выше — шапка листа,
+# заголовки секций и служебные строки — не парсятся нигде: ни в /top и /stat,
+# ни в автокомплите, ни в аудите, ни в поиске сотрудника.
+# FT: с 15-й строки включительно. RW: 17-я не включительно, т.е. с 18-й.
+FT_SHEET_START_ROW = int(os.getenv('FT_SHEET_START_ROW', 15))
+RW_SHEET_START_ROW = int(os.getenv('RW_SHEET_START_ROW', 18))
+
 # ===== ПОТОЛКИ НАКАЗАНИЙ =====
 # WARN_LIMIT — максимум варнов; STRIKE_LIMIT — сколько устников
 # автоматически конвертируются в +1 варн. В таблицу значение пишется

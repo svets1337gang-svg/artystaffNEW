@@ -12,8 +12,8 @@ from config import (
     RW_GOOGLE_SHEETS_ID, RW_SHEET_NAME,
 )
 from google_manager import (
-    google_manager, find_user_by_nick, list_nicks, collect_staff, division_ids,
-    normalize_nick, punishment_limits, SKIP_NICKS, describe_google_error,
+    find_user_by_nick, list_nicks, collect_staff, division_ids,
+    normalize_nick, punishment_limits, describe_google_error,
 )
 from style import BotStyle
 from ui_components import PERSISTENT_VIEWS, build_profile_embed, StaffMainView
@@ -31,7 +31,8 @@ class StaffBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True
-        intents.members = True
+        # members-интент был нужен только аудиту доступов (guild.members);
+        # после удаления /audit_access бот обходится дефолтными + message_content.
         super().__init__(command_prefix='/', intents=intents)
 
     async def setup_hook(self):
@@ -39,7 +40,6 @@ class StaffBot(commands.Bot):
         # работать после перезапуска бота. Состояние (ник+дивизион) зашито
         # в заголовок эмбеда и перечитывается при каждом нажатии — поэтому
         # достаточно одного экземпляра каждого view.
-        self.add_view(AuditView())
         # PERSISTENT_VIEWS хранит классы — инстанцируем здесь, внутри loop'а.
         for view_cls in PERSISTENT_VIEWS:
             self.add_view(view_cls())
@@ -87,118 +87,7 @@ async def log_action(user, action_text: str):
         logger.error(f"Logging error: {e}")
 
 
-# ===== АУДИТ ДОСТУПОВ =====
-
-def collect_missing_members(guild, division):
-    """Список ников из таблицы дивизиона, которых нет на сервере.
-
-    Поднимает GoogleAPIError, если не удалось подключиться к таблице.
-    Синхронная функция — вызывать через asyncio.to_thread.
-    """
-    if division == 'FT':
-        s_id, s_name = FT_GOOGLE_SHEETS_ID, FT_SHEET_NAME
-    else:
-        s_id, s_name = RW_GOOGLE_SHEETS_ID, RW_SHEET_NAME
-
-    # Кэшированная таблица: первый столбец — ники. Один запрос на дивизион
-    # вместо col_values + повторного чтения.
-    table = google_manager.get_table(s_id, s_name, reraise=True)
-
-    missing = []
-    for row in table:
-        name = row[0] if row else ''
-        clean_name = normalize_nick(name)
-        # Пропускаем пустые строки, "вакантно" и подобные технические записи
-        if not clean_name or clean_name.lower() in SKIP_NICKS:
-            continue
-        member = discord.utils.get(guild.members, name=clean_name)
-        if not member:
-            member = discord.utils.get(guild.members, display_name=clean_name)
-        if not member:
-            missing.append(clean_name)
-    return missing
-
-
-def build_audit_embed(guild, division):
-    """Формирует эмбед аудита для дивизиона (синхронно, гоняет gspread)."""
-    try:
-        missing = collect_missing_members(guild, division)
-    except Exception as e:
-        logger.error(f"Audit failed for {division}: {e}", exc_info=True)
-        return BotStyle.create_embed(
-            f"🔍 Аудит доступов • {division}",
-            describe_google_error(e),
-            color=BotStyle.ERROR_COLOR
-        )
-    if not missing:
-        description = f"✅ Все сотрудники дивизиона **{division}** присутствуют на сервере."
-        color = BotStyle.SUCCESS_COLOR
-    else:
-        # Discord ограничивает description эмбеда 4096 символами: на большом
-        # ростере список обрезается, иначе отправка падает с HTTP 400.
-        header = (
-            f"Следующие сотрудники **{division}** значатся в таблице, "
-            f"но **отсутствуют** на сервере ({len(missing)}):\n\n"
-        )
-        lines = []
-        rest = len(missing)
-        for n in missing:
-            line = f"• {n}"
-            # +1 — перевод строки; +60 — запас на финальное «…и ещё N»
-            if len(header) + sum(len(x) + 1 for x in lines) + len(line) + 60 > 4096:
-                break
-            lines.append(line)
-            rest -= 1
-        description = header + "\n".join(lines)
-        if rest > 0:
-            description += f"\n…и ещё {rest}"
-        color = BotStyle.WARNING_COLOR
-    return BotStyle.create_embed(f"🔍 Аудит доступов • {division}", description, color=color)
-
-
-class AuditView(discord.ui.View):
-    """Persistent view аудита.
-
-    Состояния не хранит: дивизион определяется нажатой кнопкой, данные
-    пересчитываются при каждом нажатии — поэтому один экземпляр, добавленный
-    через bot.add_view(), обслуживает все сообщения и переживает рестарт.
-    """
-
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    async def update_audit(self, interaction, division):
-        # Для component-interaction обычный defer() — это
-        # DEFERRED_UPDATE_MESSAGE: правим эмбед аудита на месте.
-        # ephemeral=True создал бы НОВОЕ сообщение на каждое нажатие.
-        await interaction.response.defer()
-        embed = await asyncio.to_thread(build_audit_embed, interaction.guild, division)
-        await interaction.edit_original_response(embed=embed, view=AuditView())
-
-    @discord.ui.button(label="Дивизион FT", style=discord.ButtonStyle.primary, custom_id="audit_ft")
-    async def ft_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.update_audit(interaction, 'FT')
-
-    @discord.ui.button(label="Дивизион RW", style=discord.ButtonStyle.primary, custom_id="audit_rw")
-    async def rw_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.update_audit(interaction, 'RW')
-
-
 # ===== COMMANDS =====
-
-# guild_only: аудит строится по guild.members, а в личных сообщениях
-# interaction.guild == None — команда падала с AttributeError. Кроме того,
-# доступ к боту ограничен правами на каналы, а в DM никаких каналов нет:
-# без guild_only управление составом было бы доступно любому, кто может
-# написать боту в личку.
-@bot.tree.command(name="audit_access", description="Проверка всех доступов (кто в таблице, но не на сервере)")
-@app_commands.guild_only()
-async def audit_access(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    # По умолчанию запускаем аудит для FT
-    embed = await asyncio.to_thread(build_audit_embed, interaction.guild, 'FT')
-    await interaction.followup.send(embed=embed, view=AuditView(), ephemeral=True)
-
 
 async def nick_autocomplete(interaction: discord.Interaction, current: str):
     """Автокомплит ников сотрудников обеих таблиц для /staff.
@@ -332,8 +221,8 @@ async def top_command(interaction: discord.Interaction, division: str = None):
 def _match_staff_member(staff, member):
     """Сотрудник таблицы, чей ник совпадает с ником/отображаемым именем участника.
 
-    Сравниваются нормализованные значения без учёта регистра — как и в
-    audit_access (name, затем display_name).
+    Сравниваются нормализованные значения без учёта регистра: сначала
+    ник участника (name), затем отображаемое имя (display_name).
     """
     for member_attr in ('name', 'display_name'):
         raw = getattr(member, member_attr, None)
